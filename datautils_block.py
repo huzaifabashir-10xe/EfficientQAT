@@ -171,6 +171,22 @@ def get_loaders(
 
 @torch.no_grad()
 def test_ppl(model, tokenizer, datasets=['wikitext2'],ppl_seqlen=2048):
+    """
+    Evaluate the perplexity (PPL) of a language model on one or more datasets.
+
+    Perplexity is a standard metric for language modeling — lower values indicate better performance.
+    This function supports auto-regressive models and handles cases where the output layer (e.g. `lm_head`)
+    is not directly available due to model wrappers (like GPTQ or InternLM-style models).
+
+    Args:
+        model (transformers.PreTrainedModel): The quantized or full-precision model to evaluate.
+        tokenizer (transformers.PreTrainedTokenizer): The tokenizer used to encode inputs.
+        datasets (list): List of dataset names to evaluate on (e.g., ["wikitext2", "c4"]).
+        ppl_seqlen (int): The sequence length to use for evaluating perplexity.
+
+    Returns:
+        dict: A dictionary mapping each dataset name to its computed perplexity.
+    """
     results = {}
     for dataset in datasets:
         testloader = get_loaders(
@@ -180,19 +196,25 @@ def test_ppl(model, tokenizer, datasets=['wikitext2'],ppl_seqlen=2048):
             seqlen=ppl_seqlen,
             test_only=True
         )
+
+        # For "c4", testloader is already tensor-like; others use .input_ids
         if "c4" in dataset:
             testenc = testloader
         else:
             testenc = testloader.input_ids
 
         seqlen = ppl_seqlen
-        nsamples = testenc.numel() // seqlen
+        nsamples = testenc.numel() // seqlen    # total number of samples based on token count
+
+        # Temporarily disable use_cache
         use_cache = model.config.use_cache
         model.config.use_cache = False
         model.eval()
         nlls = []
+
+        # Identify the output layer (logits projection head)
         if hasattr(model,'lm_head') and isinstance(model.lm_head, nn.Linear):
-            classifier = model.lm_head
+            classifier = model.lm_head      #standard case
         elif hasattr(model.model,'lm_head'):
             # for gptqmodels
             classifier = None
@@ -201,30 +223,47 @@ def test_ppl(model, tokenizer, datasets=['wikitext2'],ppl_seqlen=2048):
             classifier = model.output
         else:
             raise NotImplementedError
+        
+        # Loop over the dataset in chunks of ppl_seqlen, extracting a slice of tokenized input from the dataset
         for i in tqdm(range(nsamples)):
             batch = testenc[:, (i * seqlen) : ((i + 1) * seqlen)].to(model.device)
+            
+            # forward-pass through base model, without lm_head
             outputs = model.model(batch)
+            
+            # If classifier is separate, apply it on hidden states
+            # This gives you logits (raw predictions) for each token in the sequence.
             if classifier is not None:
                 hidden_states = outputs[0]
                 logits = classifier(hidden_states.to(classifier.weight.dtype))
             else:
                 logits = outputs[0]
+            
+            # Shift logits and labels to align next-token prediction
+            # This alignment ensures we're predicting token t+1 given token t.
+            # Think of it like training: given The cat, predict cat sat.
             shift_logits = logits[:, :-1, :]
             shift_labels = testenc[:, (i * seqlen) : ((i + 1) * seqlen)][
                 :, 1:
             ].to(shift_logits.device)
+
+            # Compute cross-entropy loss
             loss_fct = nn.CrossEntropyLoss()
             loss = loss_fct(
                 shift_logits.view(-1, shift_logits.size(-1)),
                 shift_labels.view(-1),
             )
+
+            # Scale loss to total token count
             neg_log_likelihood = loss.float() * seqlen
             nlls.append(neg_log_likelihood)
 
-
+        # aggregate all negative log-likelihoods to compute final perplexity
         ppl = torch.exp(torch.stack(nlls).sum() / (nsamples * seqlen))
         print(f'{dataset}:{ppl}')
         results[dataset] = ppl.item()
+    
+    # Restore original cache config
     model.config.use_cache = use_cache
     return results
 
