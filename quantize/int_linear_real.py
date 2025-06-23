@@ -19,11 +19,27 @@ logger = getLogger(__name__)
 
 class TritonModuleMixin:
     @classmethod
+    # Placeholder for Triton GPU kernel warm-up (if needed)
     def warmup(cls, model, transpose=False, seqlen=2048):
         pass
 
 
 class QuantLinear(nn.Module, TritonModuleMixin):
+    """
+    Implements a low-bit real quantized linear layer using packed integer weights.
+
+    This is used during inference after training with fake quantization.
+    The weights are packed into INT2/INT3/INT4/INT8 format with scale and zero-point per group.
+
+    Args:
+        bits (int): Number of quantization bits (2, 3, 4, 8).
+        group_size (int): Group size for per-group quantization.
+        infeatures (int): Number of input features.
+        outfeatures (int): Number of output features.
+        bias (bool): Whether to include a bias term.
+        trainable (bool): If True, enables gradient flow through scales (default: False).
+    """
+
     QUANT_TYPE = "triton"
 
     def __init__(
@@ -45,19 +61,27 @@ class QuantLinear(nn.Module, TritonModuleMixin):
         self.outfeatures = outfeatures
         self.bits = bits
         self.group_size = group_size if group_size != -1 else infeatures
-        self.maxq = 2 ** self.bits - 1
+        self.maxq = 2 ** self.bits - 1          # e.g., 15 for 4-bit
+        
+        # qweight: packed low-bit integer weights stored as int32
         self.register_buffer(
             'qweight',
             torch.zeros((math.ceil(infeatures / (32 // self.bits)), outfeatures), dtype=torch.int32)
         )
+
+        # scales: per-group scaling factors (learnable if trainable=True)
         self.register_parameter(
             'scales',
             torch.nn.Parameter(torch.zeros((math.ceil(infeatures / self.group_size), outfeatures), dtype=torch.float16))
         )
+
+        # qzeros: packed zero-points
         self.register_buffer(
             'qzeros',
             torch.zeros((math.ceil(infeatures / self.group_size), math.ceil(outfeatures / (32 // self.bits))), dtype=torch.int32)
         )
+
+        # g_idx: group index per input channel (for compatibility with GPTQ-style APIs)
         self.register_buffer(
             'g_idx',
             torch.tensor([i // self.group_size for i in range(infeatures)], dtype=torch.int32)
@@ -70,15 +94,26 @@ class QuantLinear(nn.Module, TritonModuleMixin):
         self.zeros_dim0, self.zeros_dim1 = self.scales.shape
         self.trainable = trainable
         self.scales.requires_grad = True
-        self.use_fake = False
+        self.use_fake = False           # if True, uses dequantized weights for faster training
 
     def post_init(self):
+        #Placeholder if you want to run something after installation
         pass
 
 
     def use_fake_quantization(self, del_quant=False,transpose=False):
-        # use fake quantization for faster training but consume more memory
+        """
+        Enables use of dequantized float weights (i.e., fake quantization).
+        This is useful during QAT or inspection. Use fake quantization for faster training but consume more memory
+
+        Args:
+            del_quant (bool): If True, deletes qweight/qzeros to save memory.
+            transpose (bool): If True, transposes the dequantized weight.
+        """
+
+        # Dequantize integer weights and zero-points
         weight = dequant_dim0(self.qweight, self.bits, self.maxq, self.infeatures, self.outfeatures)
+         # Apply dequantization formula: w = (q - z) * s
         dim0, dim1 = weight.shape
         zeros = dequant_dim1(self.qzeros, self.bits, self.maxq, self.zeros_dim0, self.zeros_dim1)
         weight = ((weight.view(-1, self.group_size, dim1) - zeros.view(-1, 1, dim1)) * self.scales.view(-1, 1, dim1)).reshape(dim0, dim1)
@@ -97,7 +132,18 @@ class QuantLinear(nn.Module, TritonModuleMixin):
             del self.g_idx
         
     def pack(self, linear, scales, zeros, g_idx=None):
+        """
+        Compresses a full-precision Linear layer into low-bit format (quantizes & packs weights).
+
+        Args:
+            linear (nn.Linear): Original linear layer to quantize.
+            scales (Tensor): Scaling factors per group.
+            zeros (Tensor): Zero points per group.
+            g_idx (Tensor, optional): Group index (unused, recomputed).
+        """
+        
         W = linear.weight.data.clone()
+        # Flatten or transpose based on original module type
         if isinstance(linear, nn.Conv2d):
             W = W.flatten(1)
         if isinstance(linear, transformers.pytorch_utils.Conv1D):
@@ -110,6 +156,7 @@ class QuantLinear(nn.Module, TritonModuleMixin):
         if linear.bias is not None:
             self.bias = linear.bias.clone().half()
 
+        # Quantize weights to integers
         intweight = []
         for idx in range(self.infeatures):
             intweight.append(
@@ -122,6 +169,7 @@ class QuantLinear(nn.Module, TritonModuleMixin):
         intweight = intweight.t().contiguous()
         intweight = intweight.numpy().astype(np.uint32)
 
+        # Pack quantized weights (bit-packing)
         i = 0
         row = 0
         qweight = np.zeros((math.ceil(intweight.shape[0]/(32//self.bits)), intweight.shape[1]), dtype=np.uint32)
@@ -155,11 +203,21 @@ class QuantLinear(nn.Module, TritonModuleMixin):
         self.qzeros = torch.from_numpy(qzeros)
 
     def forward(self, x):
+        """
+        Performs matrix multiplication with the quantized (or fake) weights.
+
+        Args:
+            x (Tensor): Input tensor of shape [batch, in_features]
+
+        Returns:
+            Tensor: Output tensor [batch, out_features]
+        """
         if self.use_fake:
             weight = self.weight
             if self.fake_transpose:
                 weight = weight.transpose(0,1)
         else:
+            # Dequantize weights from INT to FP on the fly
             weight = dequant_dim0(self.qweight, self.bits, self.maxq, self.infeatures, self.outfeatures)
             dim0, dim1 = weight.shape
             # dim2 = (dim1*dim0)//self.group_size
@@ -172,13 +230,28 @@ class QuantLinear(nn.Module, TritonModuleMixin):
 
 
 def load_quantized_model(model_path, wbits, group_size):
+    """
+    Loads a pre-trained quantized model from disk, replaces all nn.Linear layers
+    with QuantLinear, and loads packed weight checkpoint.
+
+    Args:
+        model_path (str): Path to saved quantized model directory.
+        wbits (int): Bit width (2/3/4/8).
+        group_size (int): Quantization group size.
+
+    Returns:
+        Tuple: (Quantized model, tokenizer)
+    """
+
     print(f"Loading quantized model from {model_path}")
 
     # import pdb;pdb.set_trace()
     tokenizer = AutoTokenizer.from_pretrained(model_path, use_fast=False)
     config = AutoConfig.from_pretrained(model_path)
+    # Initialize empty model with correct architecture
     with init_empty_weights():
         model = AutoModelForCausalLM.from_config(config=config,torch_dtype=torch.float16, trust_remote_code=True)
+    # Replace all nn.Linear layers with QuantLinear
     layers = model.model.layers
     for i in tqdm(range(len(layers))):
         layer = layers[i]
@@ -187,6 +260,8 @@ def load_quantized_model(model_path, wbits, group_size):
             q_linear = QuantLinear(wbits, group_size, module.in_features,module.out_features,not module.bias is None)
             q_linear.to(next(layer.parameters()).device)
             set_op_by_name(layer, name, q_linear)
+    
+    # Load pre-packed quantized weights into QuantLinear modules
     torch.cuda.empty_cache()
     gc.collect()
     model.tie_weights()
