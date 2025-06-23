@@ -102,16 +102,32 @@ def get_named_linears(module, type):
     return {name: m for name, m in module.named_modules() if isinstance(m, type)}
 
 def set_op_by_name(layer, name, new_module):
-    levels = name.split('.')
+    """
+    Replaces a nested submodule inside a PyTorch module by its dot-separated name.
+
+    This utility navigates through the hierarchy of a model using the provided string
+    name (like those from model.named_modules()) and replaces the target submodule
+    with the provided new module (e.g., a quantized version).
+
+    Args:
+        layer (nn.Module): Root module to operate on.
+        name (str): Dot-separated path to the submodule to replace.
+        new_module (nn.Module): The new module that will replace the target.
+    """
+    levels = name.split('.')                        # set the module path into components
     if len(levels) > 1:
-        mod_ = layer
+        mod_ = layer                                # Start from theroot module
+        # traverse all intermediate submodules except the last one
         for l_idx in range(len(levels)-1):
             if levels[l_idx].isdigit():
-                mod_ = mod_[int(levels[l_idx])]
+                mod_ = mod_[int(levels[l_idx])]     # If the level is an index (e.g., Sequential[0])
             else:
-                mod_ = getattr(mod_, levels[l_idx])
+                mod_ = getattr(mod_, levels[l_idx]) # Otherwise, use attribute access
+
+        # Replace the target module at the final level
         setattr(mod_, levels[-1], new_module)
     else:
+        # If the name is top-level (no dots), directly set the attribute
         setattr(layer, name, new_module)
         
 # def add_new_module(name, original_module, added_module):
