@@ -30,26 +30,53 @@ from pathlib import Path
 
 
 def is_ipex_available():
+    """
+    Checks whether Intel Extension for PyTorch (IPEX) is installed and compatible with the current PyTorch version.
+
+    Returns:
+        bool: True if IPEX is available and version-compatible with installed PyTorch, else False.
+    """
+
     def get_major_and_minor_from_version(full_version):
+        """
+        Extracts 'major.minor' version from a full semantic version string (e.g., '2.1.0' -> '2.1').
+
+        Args:
+            full_version (str): Full version string (e.g., '2.1.0').
+
+        Returns:
+            str: 'major.minor' part of the version.
+        """
         return str(version.parse(full_version).major) + "." + str(version.parse(full_version).minor)
 
+    # Get the installed PyTorch version
     _torch_version = importlib.metadata.version("torch")
+
+    # Check if IPEX is even importable (installed)
     if importlib.util.find_spec("intel_extension_for_pytorch") is None:
         return False
+
+    # Try to get the installed IPEX version
     _ipex_version = "N/A"
     try:
         _ipex_version = importlib.metadata.version("intel_extension_for_pytorch")
     except importlib.metadata.PackageNotFoundError:
-        return False
+        return False  # IPEX not actually installed
+
+    # Extract only major.minor for compatibility comparison
     torch_major_and_minor = get_major_and_minor_from_version(_torch_version)
     ipex_major_and_minor = get_major_and_minor_from_version(_ipex_version)
+
+    # Warn if IPEX and PyTorch versions don't match in major.minor
     if torch_major_and_minor != ipex_major_and_minor:
         warnings.warn(
             f"Intel Extension for PyTorch {ipex_major_and_minor} needs to work with PyTorch {ipex_major_and_minor}.*,"
             f" but PyTorch {_torch_version} is found. Please switch to the matching version and run again."
         )
         return False
-    return True
+
+    return True  # IPEX is installed and version-compatible
+
     
 
 if torch.cuda.is_available():   
@@ -61,6 +88,25 @@ DEFAULT_PAD_TOKEN = "[PAD]"
 
 @dataclass
 class ModelArguments:
+    """
+    Holds configuration arguments related to model loading and family metadata.
+
+    This dataclass is used by HuggingFace's `HfArgumentParser` to parse command-line args
+    for model selection and trust/auth settings during loading.
+
+    Attributes:
+        quant_model_path (str): Filesystem path to the quantized model produced by Block-AP.
+            Used when loading a pre-quantized model for evaluation or fine-tuning.
+        
+        model_family (str): A label used for organizing and caching datasets,
+            useful to distinguish models like 'llama-2', 'opt', etc.
+        
+        trust_remote_code (bool): Whether to trust and execute arbitrary code
+            from the model repo's `modeling.py` (via `from_pretrained()`).
+            Needed for some custom implementations on HuggingFace Hub.
+        
+        use_auth_token (bool): Whether to use a HuggingFace authentication token (e.g., for private models).
+    """
     quant_model_path: Optional[str] = field(
         default="",
         metadata={"help": "path of the quantization model by Block-AP."}
@@ -80,6 +126,12 @@ class ModelArguments:
 
 @dataclass
 class DataArguments:
+    """
+    Stores all dataset-related configuration options used during training and evaluation.
+
+    This dataclass controls dataset selection, sample limits, sequence length, 
+    evaluation protocols, and preprocessing parallelism.
+    """
     eval_dataset_size: int = field(
         default=1024, metadata={"help": "Size of validation dataset."}
     )
@@ -134,6 +186,13 @@ class DataArguments:
 
 @dataclass
 class TrainingArguments(transformers.Seq2SeqTrainingArguments):
+    """
+    Extends HuggingFace's Seq2SeqTrainingArguments with custom training options
+    for EfficientQAT quantization-aware fine-tuning and evaluation.
+
+    This class adds support for quantization configuration, memory limits,
+    optimizer choices, and evaluation-specific toggles like MMLU or perplexity.
+    """
     cache_dir: Optional[str] = field(
         default=None
     )
@@ -195,6 +254,13 @@ class TrainingArguments(transformers.Seq2SeqTrainingArguments):
 
 @dataclass
 class GenerationArguments:
+    """
+    Stores generation-related configuration options used during evaluation or prediction.
+
+    These hyperparameters control decoding strategy and token-level behavior for models
+    that use `generate()` — e.g., for text completion, summarization, instruction following, etc.
+    """
+    
     # For more hyperparameters check:
     # https://huggingface.co/docs/transformers/main_classes/text_generation#transformers.GenerationConfig
     # Length arguments
@@ -226,9 +292,25 @@ class GenerationArguments:
     no_repeat_ngram_size: Optional[int] = field(default=0)
 
 
-
 def get_accelerate_model(args, checkpoint_dir):
+    """
+    Loads and prepares a quantized model (via EfficientQAT) for training or evaluation using Accelerate.
+    
+    Key operations:
+        - Detects available compute device (GPU/XPU).
+        - Loads the quantized model and tokenizer.
+        - Sets appropriate compute dtype (fp16/bf16/fp32).
+        - Ensures model is parallelizable and correctly tokenized.
+        - Applies parameter freezing, casting, and gradient checkpointing if required.
 
+    Args:
+        args (Namespace): Parsed command-line arguments (TrainingArguments or similar).
+        checkpoint_dir (str): Path to the checkpoint directory.
+
+    Returns:
+        model (nn.Module): Prepared and configured model.
+        tokenizer (transformers.PreTrainedTokenizer): Tokenizer ready for input formatting.
+    """
     if torch.cuda.is_available():
         n_gpus = torch.cuda.device_count()
     if is_ipex_available() and torch.xpu.is_available():
@@ -383,50 +465,88 @@ def get_last_checkpoint(checkpoint_dir):
     return None, False # first training
 
 def train():
+    """
+    Main training entry point for end-to-end fine-tuning of a quantized model.
+
+    This function does the following:
+    1. Parses model, data, training, and generation arguments.
+    2. Loads a quantized model using `get_accelerate_model()`.
+    3. Initializes dataset and trainer objects.
+    4. Configures optimizer to train quantization parameters (scales).
+    5. Optionally evaluates perplexity or benchmark accuracy (e.g., MMLU).
+    6. Trains and/or evaluates the model, and saves predictions/metrics to disk.
+
+    It supports:
+        - Loading quantized models (Block-AP outputs).
+        - Training only scale parameters in QuantLinear.
+        - Perplexity evaluation (PPL) on wikitext2/C4.
+        - LM-eval tasks (PIQA, ARC, HellaSwag, etc.).
+        - MMLU benchmark evaluation.
+    """
+
+    # Step 1: Parse arguments into dataclasses
     hfparser = transformers.HfArgumentParser((
         ModelArguments, DataArguments, TrainingArguments, GenerationArguments
     ))
     model_args, data_args, training_args, generation_args, extra_args = \
         hfparser.parse_args_into_dataclasses(return_remaining_strings=True)
+    
+    # Convert GenerationArguments to Hugging Face config object
     training_args.generation_config = transformers.GenerationConfig(**vars(generation_args))
+    
+    # Combine all argument namespaces into a single one
     args = argparse.Namespace(
         **vars(model_args), **vars(data_args), **vars(training_args)
     )
 
+    # Step 2: Prepare logging directory and logger
     Path(args.output_dir).mkdir(parents=True, exist_ok=True)
     logger = utils.create_logger(args.output_dir)
     logger.info(args)
     
+    # Step 3: Check if training was already completed
     checkpoint_dir, completed_training = get_last_checkpoint(args.output_dir)
     if completed_training:
         print('Detected that training was already completed!')
 
+    # Step 4: Load quantized model and tokenizer
     model, tokenizer = get_accelerate_model(args, checkpoint_dir)
-
-    model.config.use_cache = False
+    model.config.use_cache = False      # disable caching for training
     print('loaded model')
+    
+    # Step 5: Set random seed for reproducibility
     set_seed(args.seed)
 
+    # Step 6: Load dataset (train/eval/predict splits)
     data_module = make_data_module(tokenizer=tokenizer, args=args)
-
     
-
+    # Step 7: Configure optimizer to train only quantization parameters (scales)
     optimizer_grouped_parameters = []
+    
+    # Enable training for scale parameters inside QuantLinear layers
     for name, module in model.named_modules():
         # if isinstance(module, LoraLayer):
         if isinstance(module, QuantLinear) and not 'head' in name:
             module.scales.requires_grad = True
-    optimizer_grouped_parameters.append({'params': [p for n, p in model.named_parameters() if 'scale' in n], 'weight_decay': 0.0, 'lr': args.learning_rate})
+    
+    # Collect all scale parameters for optimizer
+    optimizer_grouped_parameters.append({
+        'params': [p for n, p in model.named_parameters() if 'scale' in n],
+        'weight_decay': 0.0, 'lr': args.learning_rate
+        })
+    
     optimizer = AdamW(optimizer_grouped_parameters)
 
+    # Step 8: Initialize Hugging Face trainer
     trainer = Seq2SeqTrainer(
         model=model,
         tokenizer=tokenizer,
         args=training_args,
         optimizers=(optimizer, None),
-        **{k:v for k,v in data_module.items() if k != 'predict_dataset'},
+        **{k:v for k,v in data_module.items() if k != 'predict_dataset'},   # exclude test dataset
     )
 
+    # Step 9: Optional perplexity evaluation callback (on wikitext2 and c4)
     if args.do_ppl_eval:
         class PPLvalCallback(transformers.TrainerCallback):
             @torch.no_grad()
@@ -438,6 +558,7 @@ def train():
         trainer.add_callback(PPLvalCallback)
     
     # Verifying the datatypes and parameter counts before training.
+    # Step 10: Print number of trainable parameters by dtype
     print_trainable_parameters(args, model)
     dtypes = {}
     for _, p in model.named_parameters():
@@ -452,7 +573,7 @@ def train():
     all_metrics = {"run_name": args.run_name}
 
 
-
+    # Step 11: Training
     print(args.output_dir)
     if args.do_train:
         logger.info("*** Train ***")
@@ -462,14 +583,14 @@ def train():
         trainer.save_metrics("train", metrics)
         trainer.save_state()
         all_metrics.update(metrics)
-    # Evaluation
+    # Step 12: Evaluation on validation set
     if args.do_eval:
         logger.info("*** Evaluate ***")
         metrics = trainer.evaluate(metric_key_prefix="eval")
         trainer.log_metrics("eval", metrics)
         trainer.save_metrics("eval", metrics)
         all_metrics.update(metrics)
-    # Prediction
+    #  Step 13: Prediction on test set and decoding output
     if args.do_predict:
         logger.info("*** Predict ***")
         prediction_output = trainer.predict(test_dataset=data_module['predict_dataset'],metric_key_prefix="predict")
@@ -479,6 +600,8 @@ def train():
         predictions = tokenizer.batch_decode(
             predictions, skip_special_tokens=True, clean_up_tokenization_spaces=True
         )
+
+        # Save predictions as JSONL
         with open(os.path.join(args.output_dir, 'predictions.jsonl'), 'w') as fout:
             for i, example in enumerate(data_module['predict_dataset']):
                 example['prediction_with_input'] = predictions[i].strip()
@@ -489,10 +612,12 @@ def train():
         trainer.save_metrics("predict", prediction_metrics)
         all_metrics.update(prediction_metrics)
 
+    # Step 14: Save combined metrics (train/eval/predict)
     if (args.do_train or args.do_eval or args.do_predict):
         with open(os.path.join(args.output_dir, "metrics.json"), "w") as fout:
             fout.write(json.dumps(all_metrics))
 
+    # Step 15: Run LM-eval tasks if requested
     if args.eval_tasks != "" or args.do_mmlu_eval:
         import lm_eval
         from lm_eval.models.huggingface import HFLM
@@ -514,6 +639,8 @@ def train():
             total_acc += results['results'][task]['acc,none']
         logger.info(f'Average Acc: {total_acc/len(task_list)*100:.2f}%')
 
+    # Step 16: Run MMLU (Massive Multitask Language Understanding) evaluation.
+    # One of the most comprehensive and challenging benchmarks used to evaluate the zero-shot reasoning and generalization ability of language models.
     if args.do_mmlu_eval:
         lm_eval_model = HFLM(pretrained=model, batch_size=16)
         task_manager = lm_eval.tasks.TaskManager()
